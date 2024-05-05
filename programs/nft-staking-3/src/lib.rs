@@ -28,7 +28,7 @@ pub mod nft_staking_3 {
         )?;
         Ok(())
     }
-    pub fn stake(ctx: Context<Stake>, collections: Vec<u8>, size: u64) -> Result<()> {
+    pub fn stake<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, Stake>, collections: Vec<u8>, size: u64) -> Result<()> {
         if ctx.accounts.stake_account.owner == Pubkey::default() {
             ctx.accounts.stake_account.owner = ctx.accounts.user.key();
         } else {
@@ -36,28 +36,30 @@ pub mod nft_staking_3 {
                 return Err(CustomError::Unauthorized.into())
             }
         }
+        if collections.len() != ctx.remaining_accounts.len() {
+            return Err(CustomError::InvalidAccounts.into())
+        }
+        if size != ctx.accounts.stake_account.mints.len() as u64 {
+            return Err(CustomError::IncorrectSize.into())
+        }
+        let time = Clock::get()?.unix_timestamp;
+        for i in 0..ctx.remaining_accounts.len() {
+            let token_account = match Account::<TokenAccount>::try_from(&ctx.remaining_accounts[i]).ok() {
+                None => return Err(CustomError::InvalidAccounts.into()),
+                Some(account) => account,
+            };
+            if token_account.owner != ctx.accounts.user.key() || token_account.amount != 1 {
+                return Err(CustomError::InvalidAccounts.into())
+            }
+            ctx.accounts.stake_account.add_stake(collections[i], token_account.mint, time);
+        }
         // let user_info = ctx.accounts.user.to_account_info();
         // let metadata = Metadata::try_from_slice(&ctx.accounts.nft_metadata.data.borrow())?; 
         // if metadata.symbol != "CLB" && metadata.symbol != "UG" && metadata.symbol != "GOTM" && metadata.symbol != "GREATGOATS"
         // && metadata.symbol != "CNDY" {
         //     return Err(CustomError::IncorrectCollection.into())
         // }
-        // transfer(
-        //     CpiContext::new(
-        //         ctx.accounts.token_program.to_account_info(),
-        //         Transfer {
-        //             from: ctx.accounts.nft_account.to_account_info(),
-        //             to: ctx.accounts.stake_token_account.to_account_info(),
-        //             authority: user_info,
-        //         }
-        //     ),
-        //     1
-        // )?; // remember to add error handling
-        let time = Clock::get()?.unix_timestamp;
-        if size != ctx.accounts.stake_account.mints.len() as u64 {
-            return Err(CustomError::IncorrectSize.into())
-        }
-        let new_size = StakeInfo::space(ctx.accounts.stake_account.mints.len() + 1);
+        let new_size = StakeInfo::space(ctx.accounts.stake_account.mints.len() + collections.len());
 
         let lamports_required = Rent::get()?.minimum_balance(new_size);
         let stake_account_info = ctx.accounts.stake_account.to_account_info();
@@ -77,10 +79,9 @@ pub mod nft_staking_3 {
             )?;
         }
         stake_account_info.realloc(new_size, false)?;
-        ctx.accounts.stake_account.add_stake(collection, ctx.accounts.nft_account.mint, time);
         Ok(())
     }
-    pub fn unstake(ctx: Context<Unstake>) -> Result<()> {
+    pub fn unstake<'a, 'b, 'c: 'info, 'info>(ctx: Context<'a, 'b, 'c, 'info, Unstake>) -> Result<()> {
         // transfer nft from pda
         // close pda
         let stake = &mut ctx.accounts.stake_account;
@@ -99,9 +100,21 @@ pub mod nft_staking_3 {
         //     ),
         //     1
         // )?;
-        let index = stake.mints.iter().position(|&x| x == ctx.accounts.nft_account.mint).unwrap();
-        let time_diff = Clock::get()?.unix_timestamp - stake.staked_times[index];
-        let tokens = (time_diff as u64 * 5 * 10_u64.pow(9)) / 86400; //9 decimals in $UNISIN
+        let mut tokens: u64 = 0;
+        let time = Clock::get()?.unix_timestamp;
+        for i in 0..ctx.remaining_accounts.len() {
+            let token_account = match Account::<TokenAccount>::try_from(&ctx.remaining_accounts[i]).ok() {
+                None => return Err(CustomError::InvalidAccounts.into()),
+                Some(account) => account,
+            };
+            let index = match stake.mints.iter().position(|&x| x == token_account.mint) {
+                None => return Err(CustomError::InvalidAccounts.into()),
+                Some(index) => index
+            };
+            let time_diff = time - stake.staked_times[index];
+            tokens += time_diff as u64 * 5 * 10_u64.pow(9) / 86400; // 9 decimals
+            stake.remove_stake(index);
+        }
         transfer(
             CpiContext::new_with_signer(
                 ctx.accounts.token_program.to_account_info(),
@@ -114,7 +127,6 @@ pub mod nft_staking_3 {
             ),
             tokens
         )?;
-        stake.remove_stake(index);
         let new_size = StakeInfo::space(ctx.accounts.stake_account.mints.len());
         ctx.accounts.stake_account.to_account_info().realloc(new_size, false)?;
         Ok(())
@@ -281,15 +293,6 @@ pub struct Stake<'info> {
 
     )]
     pub stake_account: Account<'info, StakeInfo>,
-    #[account(
-        init,
-        seeds = [b"stake_account", user.key().as_ref(), nft_account.mint.as_ref()],
-        bump,
-        payer = user,
-        token::mint = mint,
-        token::authority = program_authority,
-    )]
-    pub stake_token_account: Account<'info, TokenAccount>,
     // #[account(
     //     seeds = ["metadata".as_bytes(), mpl_token_metadata::ID.as_ref(), nft_account.mint.as_ref()],
     //     bump,
@@ -299,21 +302,7 @@ pub struct Stake<'info> {
     // pub nft_metadata: UncheckedAccount<'info>,
     #[account(mut)]
     pub user: Signer<'info>,
-    #[account(
-        mut,
-        constraint = nft_account.owner == user.key(),
-        constraint = nft_account.amount == 1
-    )]
-    pub nft_account: Account<'info, TokenAccount>,
-    pub mint: Account<'info, Mint>,
     pub system_program: Program<'info, System>,
-    #[account(
-        seeds = [b"auth"],
-        bump
-    )]
-    /// CHECK:
-    pub program_authority: UncheckedAccount<'info>,
-    pub token_program: Program<'info, Token>,
 }
 
 #[derive(Accounts)]
@@ -324,16 +313,8 @@ pub struct Unstake<'info> {
         bump,
     )]
     pub stake_account: Account<'info, StakeInfo>,
-    #[account(
-        mut,
-        seeds = [b"stake_account", user.key().as_ref(), nft_account.mint.as_ref()],
-        bump,
-    )]
-    pub stake_token_account: Account<'info, TokenAccount>,
     #[account(mut)]
     pub user: Signer<'info>,
-    #[account(mut)]
-    pub nft_account: Account<'info, TokenAccount>,
     #[account(mut)]
     pub user_token_account: Account<'info, TokenAccount>,
     pub system_program: Program<'info, System>,
@@ -344,12 +325,6 @@ pub struct Unstake<'info> {
         bump,
     )]
     pub program_token_account: Account<'info, TokenAccount>,
-    #[account(
-        seeds = [b"auth"],
-        bump,
-    )]
-    /// CHECK:
-    pub program_authority: AccountInfo<'info>,
 }
 
 
